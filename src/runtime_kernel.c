@@ -13,8 +13,10 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <x86intrin.h>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 #include <sys/random.h>
+#endif
+#ifndef _WIN32
 #include <sys/resource.h>
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
@@ -48,7 +50,11 @@ static int host_clock(uint32_t id,clockid_t *out) {
     switch (id) {
     case 0: case 9: case 10: *out=CLOCK_REALTIME; return 1;            /* REALTIME(_PRECISE/_FAST) */
     case 4: case 11: case 12: case 5: case 7: case 8: *out=CLOCK_MONOTONIC; return 1; /* MONOTONIC/UPTIME */
+#ifdef CLOCK_REALTIME_COARSE
     case 13: *out=CLOCK_REALTIME_COARSE; return 1;                    /* SECOND */
+#else
+    case 13: *out=CLOCK_REALTIME; return 1;
+#endif
     case 14: *out=CLOCK_THREAD_CPUTIME_ID; return 1;
     case 2: case 15: *out=CLOCK_PROCESS_CPUTIME_ID; return 1;         /* PROF/PROCTIME */
     case 16: case 17: case 18: case 19: *out=CLOCK_MONOTONIC; return 1; /* PS4 network clocks */
@@ -204,7 +210,11 @@ static ABI int32_t guest_getrusage(int who,GuestRusage *out) {
     out->stime=(GuestTimeval){kernel/1000000,kernel%1000000};
 #else
     struct rusage r;
+#ifdef __APPLE__
+    getrusage(RUSAGE_SELF,&r); /* Thread-specific usage needs a macOS implementation. */
+#else
     getrusage(who==0 ? RUSAGE_SELF : RUSAGE_THREAD,&r);
+#endif
     out->utime=(GuestTimeval){r.ru_utime.tv_sec,r.ru_utime.tv_usec};
     out->stime=(GuestTimeval){r.ru_stime.tv_sec,r.ru_stime.tv_usec};
 #endif
@@ -217,6 +227,8 @@ static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,u
         if (!old || !oldlen) return fail_posix(EINVAL);
 #ifdef _WIN32
         if (compat_random(old,(size_t)*oldlen)) return fail_posix(EIO);
+#elif defined(__APPLE__)
+        arc4random_buf(old,(size_t)*oldlen);
 #else
         if (getrandom(old,(size_t)*oldlen,0)<0) return fail_posix(errno);
 #endif

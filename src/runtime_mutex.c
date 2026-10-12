@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include "compat_macos_pthread.h"
 typedef struct { int type; } GuestAttr;
 typedef struct { pthread_mutex_t native; } GuestMutex;
 static size_t created, locks, unlocks;
@@ -118,7 +119,11 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     if (e) return e;
     struct timespec end;
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
+#ifdef __APPLE__
+    e = timed_error(bb_macos_mutex_timedlock(&(*mutex)->native, &end));
+#else
     e = timed_error(pthread_mutex_timedlock(&(*mutex)->native, &end));
+#endif
     if (!e) ++locks;
     return e;
 }

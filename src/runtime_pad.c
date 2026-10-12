@@ -172,6 +172,9 @@ static void read_inject(void) {
     /* Whole-second mtimes: the size tells two edits within a second apart. */
     if (st.st_mtime==mtime.tv_sec && st.st_size==mtime.tv_nsec) return;
     mtime=(struct timespec){st.st_mtime,(long)st.st_size};
+#elif defined(__APPLE__)
+    if (st.st_mtimespec.tv_sec==mtime.tv_sec && st.st_mtimespec.tv_nsec==mtime.tv_nsec) return;
+    mtime=st.st_mtimespec;
 #else
     if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
     mtime=st.st_mtim;
@@ -313,6 +316,7 @@ static ABI int32_t pad_close(int32_t handle) {
 static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!data) return ERR_INVALID_ARG;
+    bbgpu_poll_events(); /* Cocoa event pumping must stay on the process main thread. */
     pthread_mutex_lock(&lock);
     sample(data); ++reads;
     pthread_mutex_unlock(&lock);

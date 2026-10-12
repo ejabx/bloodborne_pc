@@ -13,7 +13,9 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <stdexcept>
 #include <vector>
+#include <cstdio>
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
@@ -25,7 +27,7 @@
 #include "video_core/renderer_vulkan/vk_dlss.h"
 
 #ifdef __APPLE__
-#include <mach-o/dyld.h>
+#include <SDL3/SDL_vulkan.h>
 #endif
 
 namespace Vulkan {
@@ -106,14 +108,13 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
     }
 #elif defined(VK_USE_PLATFORM_METAL_EXT)
     if (window_info.type == Frontend::WindowSystemType::Metal) {
-        const vk::MetalSurfaceCreateInfoEXT macos_ci = {
-            .pLayer = static_cast<const CAMetalLayer*>(window_info.render_surface),
-        };
-
-        if (instance.createMetalSurfaceEXT(&macos_ci, nullptr, &surface) != vk::Result::eSuccess) {
-            LOG_CRITICAL(Render_Vulkan, "Failed to initialize MacOS surface");
+        VkSurfaceKHR raw_surface = VK_NULL_HANDLE;
+        if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(window_info.render_surface),
+                                      static_cast<VkInstance>(instance), nullptr, &raw_surface)) {
+            LOG_CRITICAL(Render_Vulkan, "Failed to initialize macOS surface: {}", SDL_GetError());
             UNREACHABLE();
         }
+        surface = vk::SurfaceKHR(raw_surface);
     }
 #endif
 
@@ -259,21 +260,20 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                                   bool enable_crash_diagnostic) {
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
 
-#if defined(__APPLE__)
-    // Initialize the environment with the path to the included ICD, so that the loader will
-    // find it.
-    static const auto icd_path = [] {
-        char path[PATH_MAX];
-        u32 length = PATH_MAX;
-        _NSGetExecutablePath(path, &length);
-        return std::filesystem::path(path).parent_path();
-    }();
-    setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
-#endif
-
+#ifdef __APPLE__
+    // The system Vulkan loader is installed with the SDK under /usr/local/lib. The
+    // Vulkan-Hpp basename lookup can find an unrelated loader first under Rosetta.
+    static vk::detail::DynamicLoader dl{"/usr/local/lib/libvulkan.1.dylib"};
+#else
     static vk::detail::DynamicLoader dl;
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(
-        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+#endif
+    const auto get_instance_proc_addr =
+        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    if (!dl.success() || !get_instance_proc_addr) {
+        throw std::runtime_error("Could not load vkGetInstanceProcAddr from the Vulkan loader");
+    }
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+    std::fprintf(stderr, "Vulkan init: dispatcher ready\n");
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion
@@ -285,13 +285,22 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                "Vulkan {}.{} is required, but only {}.{} is supported by instance!",
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
+    std::fprintf(stderr, "Vulkan init: API %u.%u\n", VK_VERSION_MAJOR(available_version),
+                 VK_VERSION_MINOR(available_version));
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
+    std::fprintf(stderr, "Vulkan init: layers enumerated\n");
     auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    std::fprintf(stderr, "Vulkan init: extensions enumerated\n");
+#ifdef __APPLE__
+    // MoltenVK devices are exposed only by instances that opt into portability.
+    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
     // bbport: DLSS (optional bridge DLL) needs its own instance extensions.
     if (Dlss* dlss = Dlss::Get()) {
         dlss->AppendInstanceExtensions(extensions);
     }
+    std::fprintf(stderr, "Vulkan init: optional extensions done\n");
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",
@@ -300,21 +309,21 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
         .apiVersion = available_version,
     };
+    std::fprintf(stderr, "Vulkan init: application info ready\n");
 
-    const std::string extensions_string = fmt::format("{}", fmt::join(extensions, ", "));
-    const std::string layers_string = fmt::format("{}", fmt::join(layers, ", "));
-    LOG_INFO(Render_Vulkan, "Enabled instance extensions: {}", extensions_string);
-    LOG_INFO(Render_Vulkan, "Enabled instance layers: {}", layers_string);
 
     // Validation settings
     vk::Bool32 enable_core = EmulatorSettings.IsVkValidationCoreEnabled() ? vk::True : vk::False;
     vk::Bool32 enable_sync = EmulatorSettings.IsVkValidationSyncEnabled() ? vk::True : vk::False;
     vk::Bool32 enable_gpuav = EmulatorSettings.IsVkValidationGpuEnabled() ? vk::True : vk::False;
+    std::fprintf(stderr, "Vulkan init: settings ready\n");
 
     // Crash diagnostics settings
-    static const auto crash_diagnostic_path =
-        Common::FS::GetUserPathString(Common::FS::PathType::LogDir);
+    const std::string crash_diagnostic_path = enable_crash_diagnostic
+        ? Common::FS::GetUserPathString(Common::FS::PathType::LogDir)
+        : std::string{};
     const char* log_path = crash_diagnostic_path.c_str();
+    std::fprintf(stderr, "Vulkan init: path ready\n");
     vk::Bool32 enable_force_barriers = vk::True;
 
     const std::array layer_setings = {
@@ -406,6 +415,9 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
     vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT> instance_ci_chain = {
         vk::InstanceCreateInfo{
+#ifdef __APPLE__
+            .flags = vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR,
+#endif
             .pApplicationInfo = &application_info,
             .enabledLayerCount = static_cast<u32>(layers.size()),
             .ppEnabledLayerNames = layers.data(),
@@ -418,7 +430,10 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+    std::fprintf(stderr, "Vulkan init: create info ready\n");
+    std::fprintf(stderr, "Vulkan init: creating instance\n");
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
+    std::fprintf(stderr, "Vulkan init: instance result %d\n", static_cast<int>(instance_result));
     ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",
                vk::to_string(instance_result));
 

@@ -1,4 +1,4 @@
-// bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+// bbport: SDL3 window for the Vulkan swapchain.
 #include <cstdlib>
 #include <cstring>
 #include <SDL3/SDL.h>
@@ -35,6 +35,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     if (driver && !std::strcmp(driver, "windows")) {
         window_info.type = WindowSystemType::Windows;
         window_info.render_surface = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    } else
+#endif
+#ifdef __APPLE__
+    if (driver && !std::strcmp(driver, "cocoa")) {
+        window_info.type = WindowSystemType::Metal;
+        // SDL owns the CAMetalLayer and creates the Vulkan surface for this window.
+        window_info.render_surface = window;
     } else
 #endif
     if (driver && !std::strcmp(driver, "x11")) {

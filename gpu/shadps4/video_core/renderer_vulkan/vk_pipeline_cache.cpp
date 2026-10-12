@@ -338,10 +338,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             return !instance.IsFragmentShaderBarycentricSupported() &&
                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;
         }(),
+        // KosmicKrisp is driver ID 28; MoltenVK's bundled Vulkan headers predate its enum.
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
-                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+                              static_cast<u32>(instance.GetDriverID()) == 28,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
-        .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        .needs_unorm_fixup = static_cast<u32>(instance.GetDriverID()) == 28,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };

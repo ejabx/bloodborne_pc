@@ -21,6 +21,7 @@
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
@@ -245,7 +246,15 @@ static int pool(void) {
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (pool_fd>=0) return 0;
+#ifdef __APPLE__
+    /* A temporary sparse file provides the shared aliases used by direct memory. */
+    char path[]="/tmp/bb-guest-memory.XXXXXX";
+    pool_fd=mkstemp(path);
+    if (pool_fd<0) return -1;
+    unlink(path);
+#else
     pool_fd=memfd_create("bb-guest-memory", MFD_CLOEXEC);
+#endif
     if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) return -1;
     void *view=mmap(NULL,POOL_SIZE+FLEX_SPAN,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_NORESERVE,pool_fd,0);
     if (view==MAP_FAILED) return -1;
@@ -257,12 +266,29 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
     void *mapped = !reserved
         ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
         : mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED,-1,0);
+    if (mapped==MAP_FAILED)
+        fprintf(stderr,"Runtime: mmap failed at 0x%" PRIxPTR ", size=%" PRIu64 ", prot=%d, reserved=%d, phys=0x%" PRIx64 ": %s\n",
+                address,size,prot,reserved,phys,strerror(errno));
     return mapped==MAP_FAILED ? -1 : 0;
 }
+#ifdef __APPLE__
+/* Rosetta may reject MAP_FIXED in a free part of the PS4 user range. For
+ * non-fixed guest requests, let Darwin choose a free mapping and report its
+ * actual address back to the guest. */
+static void *host_map_hint(uintptr_t hint, uint64_t size, int prot, int reserved, uint64_t phys) {
+    return !reserved
+        ? mmap((void *)hint,size,prot,MAP_SHARED,pool_fd,(off_t)phys)
+        : mmap((void *)hint,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+}
+#endif
 static int host_unmap(uintptr_t address, uint64_t size) { return munmap((void *)address,size); }
 static int host_protect(uintptr_t address, uint64_t size, int prot) { return mprotect((void *)address,size,prot); }
 static void host_discard(uint64_t phys, uint64_t size) {
+#ifdef __APPLE__
+    memset(backing_base+phys,0,size);
+#else
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
+#endif
 }
 #endif
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
@@ -377,6 +403,18 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         address=find_free(address,size,alignment);
         if (!address) return NO_MEMORY;
     }
+#ifdef __APPLE__
+    if (!(flags & MAP_FIXED_FLAG)) {
+        void *mapped=host_map_hint(address,size,host_prot(prot),kind==KIND_RESERVED,phys);
+        if (mapped==MAP_FAILED) return NO_MEMORY;
+        address=(uintptr_t)mapped;
+        if (address<USER_MIN || address>USER_MAX || size>USER_MAX-address ||
+            address%alignment || overlaps(address,address+size,1)) {
+            munmap(mapped,size);
+            return NO_MEMORY;
+        }
+    } else
+#endif
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
     void *mapped=(void *)address;
     drop_range(address,address+size);
@@ -670,7 +708,13 @@ void *runtime_low_map(size_t size, int prot) {
 #else
     void *p=MAP_FAILED;
     while (low_next+size<=USER_MIN) {
+#ifdef __APPLE__
+        /* A hint cannot replace an existing host mapping. Reject a different address. */
+        p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if (p!=MAP_FAILED && (uintptr_t)p!=low_next) { munmap(p,size); p=MAP_FAILED; }
+#else
         p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+#endif
         low_next+=size+PAGE; /* unmapped gap catches overruns */
         if (p!=MAP_FAILED) break;
     }
@@ -818,5 +862,24 @@ void runtime_memory_report(void) {
            allocations, maps, live_bytes, POOL_SIZE);
     printf("Runtime: flexible maps=%zu, in use=%" PRIu64 ", protects=%zu, queries=%zu, regions=%zu\n",
            flexible_maps, flexible_bytes, protects, queries, vma_count);
+}
+void runtime_memory_debug_fault(uintptr_t address) {
+#ifndef _WIN32
+    struct stat st={0};
+    const int stat_ok=pool_fd>=0 && fstat(pool_fd,&st)==0;
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (address>=v->start && address<v->end) {
+            fprintf(stderr,"Memory fault map: addr=%p range=[%p,%p) kind=%d prot=0x%x phys=0x%" PRIx64
+                           " file_size=%" PRId64 "\n",(void *)address,(void *)v->start,(void *)v->end,
+                    v->kind,v->prot,v->phys+(address-v->start),stat_ok?(int64_t)st.st_size:-1);
+            return;
+        }
+    }
+    fprintf(stderr,"Memory fault map: addr=%p unmapped file_size=%" PRId64 "\n",(void *)address,
+            stat_ok?(int64_t)st.st_size:-1);
+#else
+    (void)address;
+#endif
 }
 

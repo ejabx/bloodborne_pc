@@ -69,7 +69,21 @@ typedef struct {
 typedef struct { int used, registered[24]; Instance instances[MAX_INSTANCES+1]; } Context;
 typedef struct { int used, context, canceled; } Batch;
 
+#ifdef __APPLE__
+static pthread_mutex_t lock;
+__attribute__((constructor)) static void initialize_ajm_lock(void) {
+    pthread_mutexattr_t attributes;
+    if (pthread_mutexattr_init(&attributes) ||
+        pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE) ||
+        pthread_mutex_init(&lock, &attributes)) {
+        fputs("Cannot initialize Ajm mutex\n", stderr);
+        abort();
+    }
+    pthread_mutexattr_destroy(&attributes);
+}
+#else
 static pthread_mutex_t lock=PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+#endif
 static Context *contexts[MAX_CONTEXTS+1];
 static Batch batches[MAX_BATCHES];
 static size_t jobs_run, frames_decoded, batches_run;

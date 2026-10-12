@@ -179,6 +179,16 @@ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
     runtime_report();
     exit(status);
 }
+/* The renderer build omits the optional FFmpeg-backed AVPlayer module. A null
+ * handle is the library's documented init failure result and lets the game
+ * skip intro/menu videos while continuing normal startup. */
+static ABI void *guest_avplayer_init(void *data) {
+    (void)data;
+    static int reported;
+    if (!__atomic_exchange_n(&reported,1,__ATOMIC_RELAXED))
+        fprintf(stderr,"Runtime: AVPlayer video playback unavailable; returning null handle\n");
+    return NULL;
+}
 uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!(capabilities & 1)) return 0;
     if (is_data) {
@@ -206,6 +216,7 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!strcmp(name, "vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
     if (!strcmp(name, "959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
     if (!strcmp(name, "p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
+    if (!strcmp(name, "aS66RI0gGgo#m#n")) return (uintptr_t)guest_avplayer_init;
     uintptr_t mutex = runtime_mutex_resolve(name);
     if (mutex) return mutex;
     uintptr_t thread = runtime_thread_resolve(name);

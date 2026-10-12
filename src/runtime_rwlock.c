@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
+#include "compat_macos_pthread.h"
 typedef struct Holder {
     pthread_t thread;
     unsigned readers, writer, pending;
@@ -96,7 +97,11 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
         if (!time || time->nanoseconds<0 || time->nanoseconds>=1000000000) e=EINVAL;
         else {
             struct timespec deadline={.tv_sec=(time_t)time->seconds,.tv_nsec=(long)time->nanoseconds};
+#ifdef __APPLE__
+            e=bb_macos_rwlock_timedlock(&r->native,&deadline,writer);
+#else
             e=writer ? pthread_rwlock_timedwrlock(&r->native,&deadline) : pthread_rwlock_timedrdlock(&r->native,&deadline);
+#endif
         }
     }
     pthread_mutex_lock(&registry_lock);

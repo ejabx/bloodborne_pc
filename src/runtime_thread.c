@@ -15,12 +15,17 @@
 #include <setjmp.h>
 #include <errno.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <signal.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <sys/syscall.h>
 #include <sys/mman.h>
+#ifndef __APPLE__
+#include <sys/syscall.h>
 #include <asm/prctl.h>
+#endif
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
@@ -58,6 +63,23 @@ static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static ThreadAttr *attributes;
 static GuestThread *threads;
 static _Thread_local GuestThread *current;
+#ifdef __APPLE__
+void runtime_thread_trace_all(void) {
+    if (pthread_mutex_trylock(&lock)) return;
+    for (GuestThread *t=threads;t;t=t->next) {
+        fprintf(stderr,"Runtime: tracing thread '%s'\n",t->name);
+        pthread_kill(t->host,SIGUSR2);
+    }
+    pthread_mutex_unlock(&lock);
+}
+void *runtime_thread_tcb_pointer(void) {
+    if (!current || !current->tcb) {
+        fputs("STOP: guest TCB requested before thread attachment\n",stderr);
+        exit(21);
+    }
+    return current->tcb;
+}
+#endif
 static _Thread_local int32_t guest_errno;
 static const unsigned char *tls_template;
 static uint64_t tls_filesz, tls_memsz, tls_align=16;
@@ -82,6 +104,13 @@ static void set_gs(void *base) {
     if (!TlsSetValue(tls_slot,base)) { fprintf(stderr,"STOP: TlsSetValue failed (%lu)\n",GetLastError()); exit(21); }
 }
 #define tls_block_alloc(size) _aligned_malloc(size,64)
+#elif defined(__APPLE__)
+static void set_gs(void *base) {
+    /* Full GS-base thread state was unavailable in the tested Rosetta process.
+     * probe.c rewrites the guest's TCB load to a per-thread helper instead. */
+    (void)base;
+}
+#define tls_block_alloc(size) runtime_low_map((size),PROT_READ|PROT_WRITE)
 #else
 static void set_gs(void *base) {
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
@@ -106,8 +135,16 @@ static void attach(GuestThread *t) {
     current=t;
 }
 static GuestThread *new_thread(void) {
+#ifdef __APPLE__
+    /* Guest locks encode scePthreadSelf() in 40 bits, so the handle must live
+     * in the same low range as the image and guest stacks. */
+    GuestThread *t=runtime_low_map(sizeof(GuestThread),PROT_READ|PROT_WRITE);
+    if (t) memset(t,0,sizeof(*t));
+#else
     GuestThread *t=calloc(1,sizeof(*t));
+#endif
     if (!t) return NULL;
+    if (getenv("BB_TRACE_THREAD")) fprintf(stderr,"Runtime: guest thread handle %p\n",(void *)t);
     t->attr=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.stack=DEFAULT_STACK,.affinity=0x7f};
     return t;
 }
@@ -243,7 +280,11 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
 static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
+#ifdef __APPLE__
+    pthread_setname_np(host);
+#else
     pthread_setname_np(pthread_self(),host);
+#endif
 }
 #ifdef _WIN32
 #define exit_setjmp(t) bb_setjmp((t)->exit_jump)

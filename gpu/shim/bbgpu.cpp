@@ -50,7 +50,9 @@ void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, Ru
 Frontend::WindowSDL* g_window = nullptr;
 
 namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+#ifndef BB_GPU_CORE_ONLY
 namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+#endif
 namespace Libraries::VideoOut { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::Kernel { void RegisterEventQueue(Core::Loader::SymbolsResolver* sym); }
 
@@ -221,6 +223,16 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
+#ifdef __APPLE__
+    // Cocoa requires window creation and SDL video initialization on the process main thread.
+    auto* window = new Frontend::WindowSDL(width, height, title.c_str());
+    {
+        std::scoped_lock lock{g_window_mutex};
+        g_window = window;
+        g_window_ready = true;
+    }
+    g_window_cv.notify_all();
+#else
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
@@ -238,6 +250,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         std::_Exit(0);
     });
     g_window_thread.detach();
+#endif
     {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });
@@ -249,14 +262,26 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     return 0;
 }
 
+extern "C" void bbgpu_poll_events(void) {
+#ifdef __APPLE__
+    if (g_window && !g_window->PollEvents()) {
+        LOG_INFO(Frontend, "Window closed by user");
+        std::fflush(stdout);
+        std::_Exit(0);
+    }
+#endif
+}
+
 namespace Libraries::Kernel { void StartKernelService(); }
 extern "C" void bbnet_register(void); // bbnet/bbnet_glue.cpp: network and PSN (co-op)
 extern "C" void bbgpu_register_kernel(void) {
     Libraries::Kernel::StartKernelService();
     Core::Loader::SymbolsResolver resolver;
     Libraries::Kernel::RegisterEventQueue(&resolver);
+#ifndef BB_GPU_CORE_ONLY
     Libraries::AvPlayer::RegisterLib(&resolver);
     bbnet_register();
+#endif
 }
 
 extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {

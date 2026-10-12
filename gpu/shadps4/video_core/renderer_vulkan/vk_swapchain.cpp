@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <cstdio>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -20,10 +21,14 @@ static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
 
 Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& window_)
     : instance{instance_}, window{window_}, surface{CreateSurface(instance.GetInstance(), window)} {
+    std::fprintf(stderr, "Vulkan swapchain: surface created\n");
     FindPresentFormat();
+    std::fprintf(stderr, "Vulkan swapchain: format found\n");
     FindPresentMode();
+    std::fprintf(stderr, "Vulkan swapchain: mode found\n");
 
     Create(window.GetWidth(), window.GetHeight());
+    std::fprintf(stderr, "Vulkan swapchain: created\n");
     ImGui::Core::Initialize(instance, window, image_count, surface_format.format);
 }
 
@@ -40,6 +45,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
     Destroy();
 
     SetSurfaceProperties();
+    std::fprintf(stderr, "Vulkan swapchain: surface properties set\n");
 
     const std::array queue_family_indices = {
         instance.GetGraphicsQueueFamilyIndex(),
@@ -71,6 +77,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
     };
 
     auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
+    std::fprintf(stderr, "Vulkan swapchain: create result %d\n", static_cast<int>(swapchain_result));
     ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                vk::to_string(swapchain_result));
     swapchain = chain;
@@ -189,6 +196,11 @@ void Swapchain::FindPresentFormat() {
 }
 
 void Swapchain::FindPresentMode() {
+#ifdef __APPLE__
+    // FIFO is mandatory and avoids a KosmicKrisp present-mode enumeration crash.
+    present_mode = vk::PresentModeKHR::eFifo;
+    return;
+#else
     const auto [modes_result, modes] =
         instance.GetPhysicalDevice().getSurfacePresentModesKHR(surface);
     if (modes_result != vk::Result::eSuccess) {
@@ -218,6 +230,7 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+#endif
 }
 
 void Swapchain::SetSurfaceProperties() {

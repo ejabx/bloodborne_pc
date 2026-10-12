@@ -77,7 +77,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
     }
-    String(fmt::format("{:#x}", info.pgm_hash));
+    String(std::to_string(info.pgm_hash));
 
     AddCapability(spv::Capability::Shader);
     DefineArithmeticTypes();
@@ -133,16 +133,17 @@ void EmitContext::DefineArithmeticTypes() {
     U64 = Name(TypeUInt(64), "u64_id");
 
     for (u32 i = 2; i <= 4; i++) {
+        const std::string suffix = std::to_string(i) + "_id";
         if (info.uses_fp16) {
-            F16[i] = Name(TypeVector(F16[1], i), fmt::format("f16vec{}_id", i));
+            F16[i] = Name(TypeVector(F16[1], i), "f16vec" + suffix);
         }
         if (info.uses_fp64) {
-            F64[i] = Name(TypeVector(F64[1], i), fmt::format("f64vec{}_id", i));
+            F64[i] = Name(TypeVector(F64[1], i), "f64vec" + suffix);
         }
-        F32[i] = Name(TypeVector(F32[1], i), fmt::format("f32vec{}_id", i));
-        S32[i] = Name(TypeVector(S32[1], i), fmt::format("i32vec{}_id", i));
-        U32[i] = Name(TypeVector(U32[1], i), fmt::format("u32vec{}_id", i));
-        U1[i] = Name(TypeVector(U1[1], i), fmt::format("bvec{}_id", i));
+        F32[i] = Name(TypeVector(F32[1], i), "f32vec" + suffix);
+        S32[i] = Name(TypeVector(S32[1], i), "i32vec" + suffix);
+        U32[i] = Name(TypeVector(U32[1], i), "u32vec" + suffix);
+        U1[i] = Name(TypeVector(U1[1], i), "bvec" + suffix);
     }
 
     true_value = ConstantTrue(U1[1]);

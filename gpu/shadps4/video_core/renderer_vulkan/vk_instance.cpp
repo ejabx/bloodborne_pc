@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/static_vector.hpp>
+#include <cstdio>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
@@ -38,7 +39,9 @@ std::vector<std::string> GetSupportedExtensions(vk::PhysicalDevice physical) {
     std::vector<std::string> supported_extensions;
     supported_extensions.reserve(extensions.size());
     for (const auto& extension : extensions) {
-        supported_extensions.emplace_back(extension.extensionName.data());
+        const auto& name = extension.extensionName;
+        const auto length = std::find(name.begin(), name.end(), '\0') - name.begin();
+        supported_extensions.emplace_back(name.data(), static_cast<std::size_t>(length));
     }
     return supported_extensions;
 }
@@ -83,8 +86,9 @@ std::unordered_map<vk::Format, vk::FormatProperties3> GetFormatProperties(
 }
 
 std::string GetReadableVersion(u32 version) {
-    return fmt::format("{}.{}.{}", VK_VERSION_MAJOR(version), VK_VERSION_MINOR(version),
-                       VK_VERSION_PATCH(version));
+    return std::to_string(VK_VERSION_MAJOR(version)) + "." +
+           std::to_string(VK_VERSION_MINOR(version)) + "." +
+           std::to_string(VK_VERSION_PATCH(version));
 }
 
 } // Anonymous namespace
@@ -179,9 +183,13 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
     CreateDevice();
+    std::fprintf(stderr, "Vulkan init: device setup returned\n");
     CollectPhysicalMemoryInfo();
+    std::fprintf(stderr, "Vulkan init: memory info collected\n");
     CollectImageFormatInfo();
+    std::fprintf(stderr, "Vulkan init: image format info collected\n");
     CollectToolingInfo();
+    std::fprintf(stderr, "Vulkan init: tooling info collected\n");
 }
 
 Instance::~Instance() {
@@ -198,12 +206,13 @@ std::string Instance::GetDriverVersionName() {
         const u32 minor = (version >> 14) & 0x0ff;
         const u32 secondary = (version >> 6) & 0x0ff;
         const u32 tertiary = version & 0x003f;
-        return fmt::format("{}.{}.{}.{}", major, minor, secondary, tertiary);
+        return std::to_string(major) + "." + std::to_string(minor) + "." +
+               std::to_string(secondary) + "." + std::to_string(tertiary);
     }
     if (driver_id == vk::DriverId::eIntelProprietaryWindows) {
         const u32 major = version >> 14;
         const u32 minor = version & 0x3fff;
-        return fmt::format("{}.{}", major, minor);
+        return std::to_string(major) + "." + std::to_string(minor);
     }
     return GetReadableVersion(version);
 }
@@ -212,20 +221,25 @@ bool Instance::CreateDevice() {
     const vk::StructureChain feature_chain = physical_device.getFeatures2<
         vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
         vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features,
-        vk::PhysicalDeviceRobustness2FeaturesEXT,
+        vk::PhysicalDeviceRobustness2FeaturesEXT, vk::PhysicalDeviceVertexAttributeDivisorFeatures,
         vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
-        vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
+        vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR
+#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
+        , vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE
+#endif
+        >();
+    std::fprintf(stderr, "Vulkan device: feature query done\n");
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
         vk::PhysicalDeviceProperties2, vk::PhysicalDeviceVulkan11Properties,
         vk::PhysicalDeviceVulkan12Properties, vk::PhysicalDeviceVulkan13Properties,
         vk::PhysicalDevicePushDescriptorPropertiesKHR>();
+    std::fprintf(stderr, "Vulkan device: property query done\n");
     vk11_props = properties_chain.get<vk::PhysicalDeviceVulkan11Properties>();
     vk12_props = properties_chain.get<vk::PhysicalDeviceVulkan12Properties>();
     vk13_props = properties_chain.get<vk::PhysicalDeviceVulkan13Properties>();
@@ -236,43 +250,50 @@ bool Instance::CreateDevice() {
         LOG_CRITICAL(Render_Vulkan, "No extensions supported by device.");
         return false;
     }
+    std::fprintf(stderr, "Vulkan device: %zu extensions\n", available_extensions.size());
 
     boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
+        std::fprintf(stderr, "device extension check: %s (%zu available, %zu enabled)\n",
+                     extension.data(), available_extensions.size(), enabled_extensions.size());
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
-                         [&](const std::string& name) { return name == extension; });
+                         [&](const std::string& name) {
+                             return name.size() == extension.size() &&
+                                    std::memcmp(name.data(), extension.data(), extension.size()) == 0;
+                         });
 
         if (result != available_extensions.end()) {
-            LOG_INFO(Render_Vulkan, "Enabling extension: {}", extension);
+            std::fprintf(stderr, "device extension available: %s\n", extension.data());
             enabled_extensions.push_back(extension.data());
             return true;
         }
 
-        LOG_WARNING(Render_Vulkan, "Extension {} unavailable.", extension);
         return false;
     };
 
     // Required
-    ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    ASSERT_MSG(add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}",
-               VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
-    ASSERT_MSG(add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}", VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    if (!add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME) ||
+        !add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) ||
+        !add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) ||
+        !add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+        throw std::runtime_error("A required Vulkan device extension is unavailable");
+    }
 
     const auto robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
-    ASSERT_MSG(robustness2_features.robustBufferAccess2,
-               "Required Vulkan feature unavailable: robustBufferAccess2");
-    ASSERT_MSG(robustness2_features.robustImageAccess2,
-               "Required Vulkan feature unavailable: robustImageAccess2");
-    ASSERT_MSG(robustness2_features.nullDescriptor,
-               "Required Vulkan feature unavailable: nullDescriptor");
+    const auto divisor_features =
+        feature_chain.get<vk::PhysicalDeviceVertexAttributeDivisorFeatures>();
+    std::fprintf(stderr, "Vulkan device: robustness features %u %u %u\n",
+                 robustness2_features.robustBufferAccess2, robustness2_features.robustImageAccess2,
+                 robustness2_features.nullDescriptor);
+    if (!robustness2_features.robustBufferAccess2 || !robustness2_features.robustImageAccess2 ||
+        !robustness2_features.nullDescriptor) {
+        throw std::runtime_error("A required robustness2 Vulkan feature is unavailable");
+    }
+    std::fprintf(stderr, "Vulkan device: required features passed\n");
 
     // Optional
+#ifndef __APPLE__
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -357,9 +378,13 @@ bool Instance::CreateDevice() {
     compute_shader_derivatives = add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     // bbport: FSR 4.1.1 passes (dot2 of halves accumulated in float, as vkd3d-proton translates them).
     mixed_float_dot_product =
+#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
         feature_chain.get<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>()
             .shaderMixedFloatDotProductFloat16AccFloat32 &&
         add_extension(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
+#else
+        false;
+#endif
     if (compute_shader_derivatives) {
         compute_shader_derivatives_features =
             feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
@@ -372,8 +397,14 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+#else
+    // Keep the initial macOS renderer path to the four extensions needed for
+    // swapchain presentation and the PS4 renderer's required descriptor behavior.
+    const bool calibrated_timestamps = false;
+#endif
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
+    std::fprintf(stderr, "Vulkan device: queue families %zu\n", family_properties.size());
     if (family_properties.empty()) {
         LOG_CRITICAL(Render_Vulkan, "Physical device reported no queues.");
         return false;
@@ -392,6 +423,7 @@ bool Instance::CreateDevice() {
         LOG_CRITICAL(Render_Vulkan, "Unable to find graphics and/or present queues.");
         return false;
     }
+    std::fprintf(stderr, "Vulkan device: graphics queue %u\n", queue_family_index);
 
     static constexpr std::array queue_priorities = {1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
@@ -401,8 +433,11 @@ bool Instance::CreateDevice() {
     };
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
+    std::fprintf(stderr, "Vulkan device: Vulkan 1.1 features read\n");
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
+    std::fprintf(stderr, "Vulkan device: Vulkan 1.2 features read\n");
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    std::fprintf(stderr, "Vulkan device: Vulkan 1.3 features read\n");
     // bbport: DLSS (optional bridge DLL) needs its own device extensions on NVIDIA GPUs.
     std::vector<const char*> dlss_extensions;
     if (Dlss* dlss = Dlss::Get()) {
@@ -415,6 +450,77 @@ bool Instance::CreateDevice() {
             }
         }
     }
+#ifdef __APPLE__
+    vk::StructureChain device_chain = {
+        vk::DeviceCreateInfo{
+            .queueCreateInfoCount = 1u,
+            .pQueueCreateInfos = &queue_info,
+            .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
+            .ppEnabledExtensionNames = enabled_extensions.data(),
+        },
+        vk::PhysicalDeviceFeatures2{
+            .features{
+                .robustBufferAccess = features.robustBufferAccess,
+                .imageCubeArray = features.imageCubeArray,
+                .independentBlend = features.independentBlend,
+                .geometryShader = features.geometryShader,
+                .tessellationShader = features.tessellationShader,
+                .sampleRateShading = features.sampleRateShading,
+                .logicOp = features.logicOp,
+                .multiDrawIndirect = features.multiDrawIndirect,
+                .depthClamp = features.depthClamp,
+                .fillModeNonSolid = features.fillModeNonSolid,
+                .wideLines = features.wideLines,
+                .multiViewport = features.multiViewport,
+                .samplerAnisotropy = features.samplerAnisotropy,
+                .vertexPipelineStoresAndAtomics = features.vertexPipelineStoresAndAtomics,
+                .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
+                .shaderStorageImageWriteWithoutFormat =
+                    features.shaderStorageImageWriteWithoutFormat,
+                .shaderClipDistance = features.shaderClipDistance,
+                .shaderInt64 = features.shaderInt64,
+                .shaderInt16 = features.shaderInt16,
+            },
+        },
+        vk::PhysicalDeviceVulkan11Features{
+            .storageBuffer16BitAccess = vk11_features.storageBuffer16BitAccess,
+            .shaderDrawParameters = vk11_features.shaderDrawParameters,
+        },
+        vk::PhysicalDeviceVulkan12Features{
+            .samplerMirrorClampToEdge = vk12_features.samplerMirrorClampToEdge,
+            .drawIndirectCount = vk12_features.drawIndirectCount,
+            .storageBuffer8BitAccess = vk12_features.storageBuffer8BitAccess,
+            .shaderBufferInt64Atomics = vk12_features.shaderBufferInt64Atomics,
+            .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
+            .shaderFloat16 = vk12_features.shaderFloat16,
+            .shaderInt8 = vk12_features.shaderInt8,
+            .scalarBlockLayout = vk12_features.scalarBlockLayout,
+            .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
+            .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
+            .hostQueryReset = vk12_features.hostQueryReset,
+            .timelineSemaphore = vk12_features.timelineSemaphore,
+            .bufferDeviceAddress = vk12_features.bufferDeviceAddress,
+            .shaderOutputLayer = vk12_features.shaderOutputLayer,
+        },
+        vk::PhysicalDeviceVulkan13Features{
+            .robustImageAccess = vk13_features.robustImageAccess,
+            .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
+            .subgroupSizeControl = vk13_features.subgroupSizeControl,
+            .synchronization2 = vk13_features.synchronization2,
+            .dynamicRendering = vk13_features.dynamicRendering,
+            .shaderIntegerDotProduct = vk13_features.shaderIntegerDotProduct,
+            .maintenance4 = vk13_features.maintenance4,
+        },
+        vk::PhysicalDeviceRobustness2FeaturesEXT{
+            .robustBufferAccess2 = true,
+            .robustImageAccess2 = true,
+            .nullDescriptor = true,
+        },
+        vk::PhysicalDeviceVertexAttributeDivisorFeatures{
+            .vertexAttributeInstanceRateDivisor = divisor_features.vertexAttributeInstanceRateDivisor,
+        },
+    };
+#else
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -565,11 +671,16 @@ bool Instance::CreateDevice() {
             .computeDerivativeGroupLinear =
                 compute_shader_derivatives_features.computeDerivativeGroupLinear,
         },
+#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE{
             .shaderMixedFloatDotProductFloat16AccFloat32 = true,
         },
+#endif
     };
+#endif
+    std::fprintf(stderr, "Vulkan device: create chain ready\n");
 
+#ifndef __APPLE__
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();
     }
@@ -623,10 +734,15 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
     }
     if (!mixed_float_dot_product) {
+#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
+#endif
     }
+#endif
 
+    std::fprintf(stderr, "Vulkan device: creating logical device\n");
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    std::fprintf(stderr, "Vulkan device: create returned %d\n", static_cast<int>(device_result));
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
@@ -634,12 +750,14 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+    std::fprintf(stderr, "Vulkan device: dispatcher initialized\n");
     if (Dlss* dlss = Dlss::Get()) {
         dlss->Initialize(*instance, physical_device, *device);
     }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    std::fprintf(stderr, "Vulkan device: queues obtained\n");
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -673,6 +791,7 @@ bool Instance::CreateDevice() {
     }
 
     CreateAllocator();
+    std::fprintf(stderr, "Vulkan device: allocator created\n");
     return true;
 }
 
@@ -710,16 +829,10 @@ void Instance::CollectDeviceParameters() {
 
     const std::string model_name{GetModelName()};
     const std::string driver_version = GetDriverVersionName();
-    const std::string driver_name = fmt::format("{} {}", vendor_name, driver_version);
     const std::string api_version = GetReadableVersion(properties.apiVersion);
-    const std::string extensions = fmt::format("{}", fmt::join(available_extensions, ", "));
-
-    LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
-    LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
-    LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
-    LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
-    LOG_INFO(Render_Vulkan, "GPU_Vulkan_Version: {}", api_version);
-    LOG_INFO(Render_Vulkan, "GPU_Vulkan_Extensions: {}", extensions);
+    (void)model_name;
+    (void)driver_version;
+    (void)api_version;
 }
 
 void Instance::CollectPhysicalMemoryInfo() {
@@ -777,6 +890,9 @@ void Instance::CollectImageFormatInfo() {
     const auto block_texel_view_props =
         physical_device.getImageFormatProperties2(block_texel_view_info);
     supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
+#ifdef __APPLE__
+    return;
+#else
     LOG_INFO(Render_Vulkan, "Block Texel View support: {}",
              supports_block_texel_view ? "Yes" : "No");
 
@@ -801,6 +917,7 @@ void Instance::CollectImageFormatInfo() {
                         vk::to_string(format.flags & ~GetFormatFeatureFlags(format.vk_format)));
         }
     }
+#endif
 }
 
 void Instance::CollectToolingInfo() const {

@@ -16,6 +16,7 @@ add_compile_options(-fno-omit-frame-pointer)
 # profile). Covers bbgpu and the static libraries linked into it. No -march: the same build
 # runs on the Steam Deck.
 option(BB_LTO "Link-time optimization of bbgpu" ON)
+option(BB_GPU_CORE_ONLY "Build Gnm/VideoOut without network and AvPlayer services" OFF)
 set(BB_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
 set(BB_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
 if (BB_LTO)
@@ -63,7 +64,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-if (NOT WIN32)
+if (UNIX AND NOT APPLE)
     pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 endif()
 find_package(miniz QUIET)
@@ -140,7 +141,11 @@ set(COMMON
     shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
     shim/common/logging/log.cpp)
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+if (BB_GPU_CORE_ONLY)
+    set(AVPLAYER "")
+else()
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+endif()
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for bb-probe.exe to resolve, so the
 # library is static there and linked into the executable.
@@ -155,6 +160,7 @@ add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOU
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
+if (NOT BB_GPU_CORE_ONLY)
 # bbport co-op: PS4 network and PSN libraries with the shadNet client, from shadp2p
 # (github.com/Wozzardman/shadp2p, GPL-2.0), for private Bloodborne co-op servers.
 find_package(Protobuf CONFIG REQUIRED)
@@ -201,6 +207,7 @@ if (WIN32)
     target_link_libraries(bbnet PUBLIC ws2_32 iphlpapi bcrypt crypt32)
 endif()
 target_link_libraries(bbgpu PUBLIC bbnet)
+endif()
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
@@ -213,14 +220,22 @@ set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
+if (BB_GPU_CORE_ONLY)
+    target_compile_definitions(bbgpu PRIVATE BB_GPU_CORE_ONLY=1)
+endif()
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-if (NOT WIN32)
+if (APPLE)
+    target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
+elseif (NOT WIN32)
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 miniz::miniz Zydis::Zydis sirit)
+if (NOT BB_GPU_CORE_ONLY)
+    target_link_libraries(bbgpu PUBLIC PkgConfig::FFMPEG)
+endif()
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
@@ -228,8 +243,15 @@ if (WIN32)
     target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
     target_include_directories(bbgpu PRIVATE third_party/xbyak)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
-else()
+elseif (NOT APPLE)
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
+endif()
+if (APPLE)
+    target_include_directories(bbgpu PRIVATE third_party/xbyak)
+    # The host's Homebrew fmt dylib may be arm64-only while this target is
+    # built for x86-64 under Rosetta. Inline fmt so no unresolved fmt calls are
+    # deferred until a guest shader happens to format a debug name.
+    target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_METAL_EXT FMT_HEADER_ONLY)
 endif()
 
 # bbport (Windows): bbgpu is a static library there, so the loader and the HLE runtime are

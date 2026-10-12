@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
+#include <cstdio>
 #include <optional>
 
 #include "common/assert.h"
@@ -69,11 +70,15 @@ CommandPool::CommandPool(const Instance& instance, Semaphore* work_semaphore)
         .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
     };
     const vk::Device device = instance.GetDevice();
+    std::fprintf(stderr, "Vulkan scheduler: creating command pool\n");
     auto [pool_result, pool] = device.createCommandPoolUnique(pool_create_info);
+    std::fprintf(stderr, "Vulkan scheduler: command pool result %d\n", static_cast<int>(pool_result));
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create command pool: {}",
                vk::to_string(pool_result));
     cmd_pool = std::move(pool);
+    std::fprintf(stderr, "Vulkan scheduler: naming command pool\n");
     SetObjectName(device, *cmd_pool, "CommandPool");
+    std::fprintf(stderr, "Vulkan scheduler: command pool ready\n");
 }
 
 CommandPool::~CommandPool() = default;

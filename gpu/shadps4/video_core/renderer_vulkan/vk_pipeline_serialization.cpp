@@ -308,6 +308,10 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 }
 
 void PipelineCache::WarmUp() {
+#ifdef __APPLE__
+    // The macOS Rosetta build has no configured writable shadPS4 cache directory yet.
+    return;
+#endif
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
     }

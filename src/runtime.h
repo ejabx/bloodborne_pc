@@ -25,6 +25,7 @@ uintptr_t runtime_mutex_resolve(const char *name);
 void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
+void runtime_memory_debug_fault(uintptr_t address);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 const char *runtime_import_name(const char *name);
 uintptr_t runtime_rwlock_resolve(const char *name);
@@ -37,6 +38,9 @@ uintptr_t runtime_thread_resolve(const char *name);
 void runtime_thread_report(void);
 void runtime_set_main_tls(const void *data, uint64_t filesz, uint64_t memsz, uint64_t align);
 void runtime_thread_attach_main(void);
+#ifdef __APPLE__
+void runtime_thread_trace_all(void);
+#endif
 int32_t *runtime_errno(void);
 uintptr_t runtime_sema_resolve(const char *name);
 void runtime_sema_report(void);

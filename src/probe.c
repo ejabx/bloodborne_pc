@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <limits.h>
 #include "runtime.h"
 #include "gpu/bbgpu.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
@@ -14,15 +15,24 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#ifndef __APPLE__
 #include <malloc.h>
+#endif
 #include <unistd.h>
 #include <signal.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#include <pthread.h>
+#else
 #include <ucontext.h>
+#endif
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#ifndef __APPLE__
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#endif
 #endif
 
 typedef struct { uint64_t address, size, flags; } Segment;
@@ -72,6 +82,35 @@ static void protect(void *p, size_t size, unsigned flags) {
     if (mprotect(p, size, mode)) fail("mprotect failed");
 #endif
 }
+#ifdef __APPLE__
+void *bb_macos_guest_tcb(void);
+static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
+    /* The linkers turn fs:[0] into gs:[0]. A 5-byte relative call plus four
+     * NOPs fits the original 9-byte load without moving guest instructions. */
+    static const unsigned char load[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0};
+    unsigned char *trampoline=allocate(page_size);
+    void *handler=(void *)bb_macos_guest_tcb;
+    trampoline[0]=0xff; trampoline[1]=0x25;
+    memset(trampoline+2,0,4);
+    memcpy(trampoline+6,&handler,sizeof(handler));
+    protect(trampoline,page_size,5);
+    uint64_t patched=0;
+    for (uint64_t s=0;s<count;++s) {
+        if (!(segments[s].flags&1) || segments[s].size<sizeof(load)) continue;
+        unsigned char *at=image+segments[s].address;
+        unsigned char *end=at+segments[s].size-sizeof(load);
+        for (;at<=end;++at) {
+            if ((at[0]!=0x65 && at[0]!=0x64) || memcmp(at+1,load+1,sizeof(load)-1)) continue;
+            int64_t distance=(int64_t)(uintptr_t)trampoline-(int64_t)(uintptr_t)(at+5);
+            if (distance<INT32_MIN || distance>INT32_MAX) fail("guest TLS trampoline is more than 2 GiB away");
+            int32_t rel=(int32_t)distance;
+            at[0]=0xe8; memcpy(at+1,&rel,4); memset(at+5,0x90,4);
+            ++patched; at+=sizeof(load)-1;
+        }
+    }
+    return patched;
+}
+#endif
 static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argument) {
     if (id >= import_count) fail("bad import trap index");
     printf("STOP: first unsupported PS4 import: %s (index %u)\n", names[id], id);
@@ -81,7 +120,7 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     uintptr_t caller=(uintptr_t)__builtin_return_address(0)-(uintptr_t)image;
     for (uint64_t m=0;m<module_count;++m)
         if (caller>=modules[m].base && caller-modules[m].base<modules[m].size)
-            printf("Caller in linked module %" PRIu64 " (%s): +0x%" PRIxPTR "\n",m,m==0 ? "libc.prx" : "system module",caller-modules[m].base);
+            printf("Caller in linked module %" PRIu64 " (%s): +0x%" PRIxPTR "\n",m,m==0 ? "libc.prx" : "system module",(uintptr_t)(caller-modules[m].base));
     runtime_report();
     puts(entered_game ? "Original guest entry instructions executed; game initialization is incomplete." :
                         "Native libc initialization is incomplete; game entry has not run.");
@@ -91,7 +130,12 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
 #ifndef _WIN32
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
-__asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
+#ifdef __APPLE__
+#define ENTER_ON_STACK_SYMBOL "_enter_on_stack"
+#else
+#define ENTER_ON_STACK_SYMBOL "enter_on_stack"
+#endif
+__asm__(".text\n.globl " ENTER_ON_STACK_SYMBOL "\n" ENTER_ON_STACK_SYMBOL ":\n"
         " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
         " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
@@ -192,9 +236,33 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 }
 #endif
 #ifndef _WIN32
+#ifdef __APPLE__
+static void dump_guest_frames(ucontext_t *uc) {
+    uintptr_t rbp=(uintptr_t)uc->uc_mcontext->__ss.__rbp;
+    uintptr_t rsp=(uintptr_t)uc->uc_mcontext->__ss.__rsp;
+    char line[160];
+    for (int depth=0;depth<16;++depth) {
+        if ((rbp&7) || rbp<rsp || rbp-rsp>8*1024*1024) break;
+        const uintptr_t *frame=(const uintptr_t *)rbp;
+        uintptr_t next=frame[0], ret=frame[1];
+        if (!ret) break;
+        const uintptr_t base=(uintptr_t)image;
+        int n=snprintf(line,sizeof(line),"  guest frame #%d: return=%p offset=0x%lx\n",
+                       depth,(void *)ret,(unsigned long)(ret>=base && ret-base<0x20000000 ? ret-base : 0));
+        if (n>0) { ssize_t written_=write(2,line,(size_t)n<sizeof(line) ? (size_t)n : sizeof(line)-1); (void)written_; }
+        if (next<=rbp || next-rbp>8*1024*1024) break;
+        rbp=next;
+    }
+}
+#endif
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
+#ifdef __APPLE__
+    if (gpu_enabled && (sig == SIGSEGV || sig == SIGBUS) &&
+        bbgpu_handle_fault(context, info->si_addr)) return;
+#else
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
+#endif
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;
@@ -207,18 +275,26 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
+#ifdef __APPLE__
+    uintptr_t rip = (uintptr_t)uc->uc_mcontext->__ss.__rip;
+#else
     uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#endif
     char line[512];
     Dl_info where;
     if (rip - (uintptr_t)image < 0x10000000)
-        snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p\n",
-                 sig, (unsigned long)(rip - (uintptr_t)image), info->si_addr);
+        snprintf(line, sizeof(line), "Guest fault (signal %d, code %d) at guest offset 0x%lx, address %p\n",
+                 sig, info->si_code, (unsigned long)(rip - (uintptr_t)image), info->si_addr);
     else if (dladdr((void *)rip, &where) && where.dli_fname)
         snprintf(line, sizeof(line), "Host fault (signal %d) in %s+0x%lx (%s), address %p\n", sig, where.dli_fname,
                  (unsigned long)(rip - (uintptr_t)where.dli_fbase), where.dli_sname ? where.dli_sname : "?", info->si_addr);
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    if (sig == SIGBUS) runtime_memory_debug_fault((uintptr_t)info->si_addr);
+#ifdef __APPLE__
+    if (rip - (uintptr_t)image < 0x20000000) dump_guest_frames(uc);
+#endif
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
@@ -234,7 +310,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
     _exit(128 + sig);
 }
 #endif
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 /* Watchdog: dump RIP and the rbp frame chain of every thread (guest offsets
  * when inside the image). Reads use process_vm_readv so bad frames cannot fault. */
 static uintptr_t exe_base;
@@ -279,6 +355,42 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
         }
     usleep(100000);
     _exit(128 + sig);
+}
+#endif
+#ifdef __APPLE__
+static unsigned mac_timeout_seconds;
+static void mac_watchdog_dump(int sig, siginfo_t *info, void *context) {
+    (void)sig; (void)info;
+    ucontext_t *uc=context;
+    uintptr_t rip=(uintptr_t)uc->uc_mcontext->__ss.__rip;
+    uintptr_t base=(uintptr_t)image;
+    char line[256];
+    int n=snprintf(line,sizeof(line),
+                   "STOP: macOS CPU watchdog; thread=0x%" PRIxPTR ", RIP=0x%" PRIxPTR ", guest offset=0x%" PRIxPTR
+                   ", RSP=0x%llx, RBP=0x%llx, RDI=0x%llx\n",
+                   (uintptr_t)pthread_self(),rip,rip-base,uc->uc_mcontext->__ss.__rsp,
+                   uc->uc_mcontext->__ss.__rbp,uc->uc_mcontext->__ss.__rdi);
+    if (n>0) { ssize_t written_=write(2,line,(size_t)n<sizeof(line) ? (size_t)n : sizeof(line)-1); (void)written_; }
+    Dl_info where;
+    if (dladdr((void *)rip,&where) && where.dli_fname)
+        dprintf(2,"  current host: %s+0x%" PRIxPTR " (%s)\n",where.dli_fname,
+                rip-(uintptr_t)where.dli_fbase,where.dli_sname ? where.dli_sname : "?");
+    void *frames[16];
+    int depth=backtrace(frames,16);
+    for (int i=2;i<depth;++i) {
+        if (dladdr(frames[i],&where) && where.dli_fname)
+            dprintf(2,"  #%d %s+0x%" PRIxPTR " (%s)\n",i,where.dli_fname,
+                    (uintptr_t)frames[i]-(uintptr_t)where.dli_fbase,
+                    where.dli_sname ? where.dli_sname : "?");
+        else dprintf(2,"  #%d %p\n",i,frames[i]);
+    }
+}
+static void *mac_watchdog(void *unused) {
+    (void)unused;
+    sleep(mac_timeout_seconds);
+    runtime_thread_trace_all();
+    usleep(200000);
+    _exit(124);
 }
 #endif
 /* param.sfo lookup: string or integer value of key, 0 when absent. */
@@ -370,7 +482,9 @@ void runtime_restart(void) {
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
+#ifndef __APPLE__
     syscall(SYS_close_range, 3u, ~0u, 0u);
+#endif
     execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
     _exit(1);
@@ -379,7 +493,7 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
     mallopt(M_ARENA_MAX,1);
@@ -452,6 +566,7 @@ int main(int argc, char **argv) {
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+#ifndef __APPLE__
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
@@ -459,6 +574,10 @@ int main(int argc, char **argv) {
     struct sigaction alarm_action = {0}; alarm_action.sa_sigaction = watchdog; alarm_action.sa_flags = SA_SIGINFO;
     sigemptyset(&alarm_action.sa_mask); sigaction(SIGALRM, &alarm_action, NULL);
     alarm(timeout_seconds); /* 0 disables the watchdog */
+#else
+    struct sigaction trace = {0}; trace.sa_sigaction=mac_watchdog_dump; trace.sa_flags=SA_SIGINFO;
+    sigemptyset(&trace.sa_mask); sigaction(SIGUSR2,&trace,NULL);
+#endif
 #endif
     FILE *f = fopen(argv[1], "rb");
     if (!f) fail("cannot open boot file; run prepare.py first");
@@ -606,6 +725,8 @@ int main(int argc, char **argv) {
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
+#elif defined(__APPLE__)
+    printf("Guest TCB loads redirected to macOS thread shim: %" PRIu64 "\n",patch_tcb_loads(segments,ns));
 #endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
@@ -640,6 +761,14 @@ int main(int argc, char **argv) {
     }
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
+#ifdef __APPLE__
+    if (timeout_seconds) {
+        mac_timeout_seconds=timeout_seconds;
+        pthread_t watchdog_thread;
+        if (pthread_create(&watchdog_thread,NULL,mac_watchdog,NULL)) fail("cannot start macOS watchdog");
+        pthread_detach(watchdog_thread);
+    }
+#endif
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
 #ifdef _WIN32
     typedef void (ABI *Entry)(void *, void (ABI *)(void));

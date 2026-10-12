@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_write_log.h"
+#include "bbport_threads.h"
 
 #include <array>
 #include <atomic>
@@ -9,6 +10,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #undef near
+#elif defined(__APPLE__)
+#include <sys/ucontext.h>
 #else
 #include <ucontext.h>
 #include <unistd.h>
@@ -61,7 +64,7 @@ void Note(std::uint64_t address, const void* data, std::uint64_t size, Source so
 }
 
 void Record(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
-    static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
+    static thread_local const std::uint32_t tid = BbThreads::CurrentTid();
     Entry e{address, size, 0, __rdtsc(), source, tid};
     std::memcpy(&e.first, data, size < 8 ? size : 8);
     Push(ring, head, e);
@@ -93,6 +96,11 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     // The loader passes EXCEPTION_POINTERS (see signal_context.cpp).
     const CONTEXT* c = static_cast<const EXCEPTION_POINTERS*>(ucontext)->ContextRecord;
     const std::uint64_t regs[] = {c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R14, c->R15};
+#elif defined(__APPLE__)
+    const auto* uc = static_cast<const ucontext_t*>(ucontext);
+    const auto* g = &uc->uc_mcontext->__ss;
+    const std::uint64_t regs[] = {g->__rax, g->__rbx, g->__rcx, g->__rdx,
+                                  g->__rsi, g->__rdi, g->__r14, g->__r15};
 #else
     const auto* uc = static_cast<const ucontext_t*>(ucontext);
     const auto* g = uc->uc_mcontext.gregs;

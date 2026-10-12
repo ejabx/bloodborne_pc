@@ -10,6 +10,8 @@
 #ifdef _WIN32
 #include <bit>
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
 #else
 #include <sched.h>
 #include <sys/resource.h>
@@ -17,6 +19,15 @@
 #endif
 
 namespace BbThreads {
+inline unsigned CurrentTid() {
+#ifdef __APPLE__
+    uint64_t id = 0;
+    pthread_threadid_np(nullptr, &id);
+    return static_cast<unsigned>(id);
+#else
+    return static_cast<unsigned>(gettid());
+#endif
+}
 #ifdef _WIN32
 /// Hardware threads available to the process (its affinity mask).
 inline unsigned Available() {
@@ -30,6 +41,15 @@ inline unsigned Available() {
 /// The calling thread only runs when cores are otherwise idle (lowest Windows priority).
 inline void MakeBackground() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+}
+#elif defined(__APPLE__)
+
+inline unsigned Available() {
+    return std::max(1u, std::thread::hardware_concurrency());
+}
+
+inline void MakeBackground() {
+    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
 }
 #else
 
